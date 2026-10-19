@@ -6,7 +6,7 @@ use crate::{
     },
     storage::{
         put_escrow, DataKey, PauseFlag, CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION,
-        PRIVACY_ENABLED_KEY,
+        MIN_ADMIN_TRANSFER_DELAY, PRIVACY_ENABLED_KEY,
     },
     EscrowEntry, EscrowStatus, QuickexContract, QuickexContractClient,
 };
@@ -355,8 +355,8 @@ fn event_data_map(env: &Env, data: Val) -> Map<Symbol, Val> {
 
 #[test]
 fn test_event_schema_catalog_locks_canonical_topics_and_payloads() {
-    assert_eq!(EVENT_SCHEMA_VERSION, 2);
-    assert_eq!(EVENT_SCHEMAS.len(), 29);
+    assert_eq!(EVENT_SCHEMA_VERSION, 4);
+    assert_eq!(EVENT_SCHEMAS.len(), 41);
 
     let escrow_deposited = EVENT_SCHEMAS
         .iter()
@@ -372,6 +372,7 @@ fn test_event_schema_catalog_locks_canonical_topics_and_payloads() {
             "amount_due",
             "amount_paid",
             "expires_at",
+            "receipt_reference",
             "schema_version",
             "timestamp",
             "token"
@@ -704,14 +705,38 @@ fn test_commitment_cycle() {
     assert!(!is_valid_bad_salt);
 }
 
+/// SC-W8-02: `create_escrow(_from, _to, _amount)` was a stub — every argument
+/// was ignored (`_`-prefixed) and it only incremented an internal counter, so
+/// it "succeeded" silently no matter what was passed in, never moved funds,
+/// and never checked authorization. It has been removed; `deposit` (and its
+/// `_with_commitment` / `_partial` siblings) is the sole escrow-creation
+/// entrypoint. Unlike the removed stub, it actually validates its arguments
+/// — an invalid amount is rejected rather than silently accepted — and moves
+/// real funds under the depositor's authorization.
 #[test]
-fn test_create_escrow() {
+fn test_create_escrow_stub_removed_deposit_validates_args_and_moves_funds() {
     let (env, client) = setup();
-    let from = Address::generate(&env);
-    let to = Address::generate(&env);
-    let amount = 1_000;
-    let escrow_id = client.create_escrow(&from, &to, &amount);
-    assert!(escrow_id > 0);
+    let token = create_test_token(&env);
+    let owner = Address::generate(&env);
+    let salt = Bytes::from_slice(&env, b"sc_w8_02_salt");
+
+    // What the removed stub would have silently accepted (amount = 0) is
+    // now rejected by real argument validation.
+    let result = client.try_deposit(&token, &0, &owner, &salt, &0, &None, &0u64, &u64::MAX);
+    assert_eq!(result, Err(Ok(QuickexError::InvalidAmount)));
+
+    // A well-formed deposit succeeds and actually transfers funds — the
+    // stub never touched a token at all.
+    token::StellarAssetClient::new(&env, &token).mint(&owner, &1_000);
+    let commitment = client.deposit(&token, &1_000, &owner, &salt, &0, &None, &1u64, &u64::MAX);
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&owner), 0);
+    assert_eq!(token_client.balance(&client.address), 1_000);
+    assert_eq!(
+        client.get_commitment_state(&commitment),
+        Some(EscrowStatus::Pending)
+    );
 }
 
 #[test]
@@ -837,6 +862,9 @@ fn test_event_snapshot_escrow_deposited_schema() {
     assert!(data_map.get(Symbol::new(&env, "amount_paid")).is_some());
     assert!(data_map.get(Symbol::new(&env, "expires_at")).is_some());
     assert!(data_map.get(Symbol::new(&env, "timestamp")).is_some());
+    assert!(data_map
+        .get(Symbol::new(&env, "receipt_reference"))
+        .is_some());
 }
 
 #[test]
@@ -883,6 +911,9 @@ fn test_event_snapshot_escrow_withdrawn_schema() {
     assert!(data_map.get(Symbol::new(&env, "token")).is_some());
     assert!(data_map.get(Symbol::new(&env, "amount")).is_some());
     assert!(data_map.get(Symbol::new(&env, "timestamp")).is_some());
+    assert!(data_map
+        .get(Symbol::new(&env, "receipt_reference"))
+        .is_some());
 }
 
 #[test]
@@ -934,6 +965,9 @@ fn test_event_snapshot_escrow_refunded_schema() {
     assert!(data_map.get(Symbol::new(&env, "token")).is_some());
     assert!(data_map.get(Symbol::new(&env, "amount")).is_some());
     assert!(data_map.get(Symbol::new(&env, "timestamp")).is_some());
+    assert!(data_map
+        .get(Symbol::new(&env, "receipt_reference"))
+        .is_some());
 }
 
 #[test]
@@ -1397,8 +1431,11 @@ fn test_set_admin() {
     // Initialize admin
     client.initialize(&admin);
 
-    // Transfer admin rights
-    client.set_admin(&admin, &new_admin);
+    // Propose, wait out the timelock, then accept — there is no instant path.
+    client.propose_admin_transfer(&admin, &new_admin, &MIN_ADMIN_TRANSFER_DELAY);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + MIN_ADMIN_TRANSFER_DELAY);
+    client.accept_admin_transfer(&new_admin);
 
     // Verify new admin is set
     assert_eq!(client.get_admin(), Some(new_admin.clone()));
@@ -1415,8 +1452,13 @@ fn test_event_snapshot_admin_changed_schema() {
     let new_admin = Address::generate(&env);
 
     client.initialize(&old_admin);
-    client.set_admin(&old_admin, &new_admin);
+    client.propose_admin_transfer(&old_admin, &new_admin, &MIN_ADMIN_TRANSFER_DELAY);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + MIN_ADMIN_TRANSFER_DELAY);
+    client.accept_admin_transfer(&new_admin);
 
+    // accept_admin_transfer emits AdminTransferAccepted followed by the
+    // general-purpose AdminChanged event; the latter is what this test locks.
     let (topics, data) = latest_contract_event(&env, &client.address);
 
     let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
@@ -1449,8 +1491,9 @@ fn test_set_admin_by_non_admin_fails() {
     // Initialize admin
     client.initialize(&admin);
 
-    // Non-admin tries to transfer admin rights - should fail
-    let result = client.try_set_admin(&non_admin, &new_admin);
+    // Non-admin tries to propose an admin transfer - should fail
+    let result =
+        client.try_propose_admin_transfer(&non_admin, &new_admin, &MIN_ADMIN_TRANSFER_DELAY);
     assert_contract_error(result, QuickexError::InsufficientRole);
 }
 
@@ -1463,8 +1506,11 @@ fn test_old_admin_cannot_pause_after_transfer() {
     // Initialize admin
     client.initialize(&admin);
 
-    // Transfer admin rights
-    client.set_admin(&admin, &new_admin);
+    // Transfer admin rights via the timelocked flow
+    client.propose_admin_transfer(&admin, &new_admin, &MIN_ADMIN_TRANSFER_DELAY);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + MIN_ADMIN_TRANSFER_DELAY);
+    client.accept_admin_transfer(&new_admin);
 
     // Old admin tries to pause - should fail
     let result = client.try_set_paused(&admin, &true, &1u32);
@@ -1568,6 +1614,37 @@ fn test_verify_proof_view_valid() {
 
     let is_valid = client.verify_proof_view(&amount, &salt, &owner);
     assert!(is_valid);
+}
+
+#[test]
+fn test_verify_proof_view_underfunded_escrow_returns_false() {
+    let (env, client) = setup();
+    let token = create_test_token(&env);
+    let owner = Address::generate(&env);
+    let amount_due: i128 = 1000;
+    let initial_payment: i128 = 500;
+    let salt = Bytes::from_slice(&env, b"underfunded_proof_salt");
+
+    token::StellarAssetClient::new(&env, &token).mint(&owner, &initial_payment);
+    let commitment = client.deposit_partial(
+        &token,
+        &amount_due,
+        &initial_payment,
+        &owner,
+        &salt,
+        &0,
+        &None,
+        &0u64,
+        &u64::MAX,
+    );
+
+    let details = client.get_escrow_details(&commitment, &owner).unwrap();
+    assert_eq!(details.amount_due, Some(amount_due));
+    assert_eq!(details.amount_paid, Some(initial_payment));
+    assert_eq!(details.status, EscrowStatus::Pending);
+    assert_eq!(details.expires_at, 0);
+
+    assert!(!client.verify_proof_view(&amount_due, &salt, &owner));
 }
 
 #[test]
@@ -3928,6 +4005,161 @@ fn test_multi_payment_sequence() {
     assert_eq!(details.amount_due, Some(1000));
 }
 
+fn assert_partial_accounting(
+    client: &QuickexContractClient,
+    commitment: &BytesN<32>,
+    caller: &Address,
+    expected_due: i128,
+    settled: i128,
+    refunded: i128,
+) {
+    let details = client.get_escrow_details(commitment, caller).unwrap();
+    let amount_paid = details.amount_paid.unwrap();
+    let outstanding = expected_due - amount_paid;
+    let fees = 0i128;
+
+    assert!(amount_paid >= 0);
+    assert!(outstanding >= 0);
+    assert_eq!(settled + refunded + outstanding + fees, expected_due);
+}
+
+#[test]
+fn test_partial_payment_accounting_invariant_after_each_operation() {
+    let ctx = crate::test_context::TestContext::with_admin();
+    let amount_due = 1_000i128;
+    let initial_payment = 250i128;
+    ctx.mint(&ctx.alice, initial_payment);
+    let commitment = ctx.client.deposit_partial(
+        &ctx.token,
+        &amount_due,
+        &initial_payment,
+        &ctx.alice,
+        &ctx.salt(b"accounting_each_operation"),
+        &100,
+        &None,
+        &0,
+        &u64::MAX,
+    );
+    ctx.mint(&ctx.bob, 750);
+
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, amount_due, 250, 0);
+    ctx.client
+        .partial_payment(&commitment, &ctx.bob, &125, &0, &u64::MAX);
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, amount_due, 375, 0);
+    ctx.client
+        .partial_payment(&commitment, &ctx.bob, &625, &1, &u64::MAX);
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, amount_due, 1_000, 0);
+}
+
+#[test]
+fn test_partial_payment_timeout_refund_preserves_accounting() {
+    let ctx = crate::test_context::TestContext::with_admin();
+    let amount_due = 1_000i128;
+    let initial_payment = 400i128;
+    ctx.mint(&ctx.alice, initial_payment);
+    let commitment = ctx.client.deposit_partial(
+        &ctx.token,
+        &amount_due,
+        &initial_payment,
+        &ctx.alice,
+        &ctx.salt(b"accounting_timeout"),
+        &100,
+        &None,
+        &0,
+        &u64::MAX,
+    );
+    ctx.mint(&ctx.bob, 200);
+    ctx.client
+        .partial_payment(&commitment, &ctx.bob, &200, &0, &u64::MAX);
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, amount_due, 600, 0);
+
+    ctx.advance_time(100);
+    ctx.client.finalize_expired_escrow(&commitment);
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, amount_due, 0, 600);
+    assert_eq!(ctx.balance(&ctx.alice), 600);
+}
+
+#[test]
+fn test_partial_payment_rejects_initial_overpayment_and_expired_payment() {
+    let ctx = crate::test_context::TestContext::with_admin();
+    let initial = ctx.client.try_deposit_partial(
+        &ctx.token,
+        &100,
+        &101,
+        &ctx.alice,
+        &ctx.salt(b"initial_overpayment"),
+        &0,
+        &None,
+        &0,
+        &u64::MAX,
+    );
+    assert_contract_error(initial, QuickexError::Overpayment);
+
+    ctx.mint(&ctx.alice, 40);
+    let commitment = ctx.client.deposit_partial(
+        &ctx.token,
+        &100,
+        &40,
+        &ctx.alice,
+        &ctx.salt(b"expired_partial"),
+        &10,
+        &None,
+        &1,
+        &u64::MAX,
+    );
+    ctx.mint(&ctx.bob, 60);
+    ctx.advance_time(10);
+    let payment = ctx
+        .client
+        .try_partial_payment(&commitment, &ctx.bob, &60, &0, &u64::MAX);
+    assert_contract_error(payment, QuickexError::EscrowExpired);
+    assert_partial_accounting(&ctx.client, &commitment, &ctx.alice, 100, 40, 0);
+}
+
+#[test]
+fn test_partial_payment_accounting_includes_settlement_fee() {
+    let ctx = crate::test_context::TestContext::with_fees(250);
+    let amount_due = 1_000i128;
+    let initial_payment = 400i128;
+    let salt = ctx.salt(b"accounting_settlement_fee");
+    ctx.mint(&ctx.alice, initial_payment);
+    ctx.mint(&ctx.bob, amount_due - initial_payment);
+    let commitment = ctx.client.deposit_partial(
+        &ctx.token,
+        &amount_due,
+        &initial_payment,
+        &ctx.alice,
+        &salt,
+        &0,
+        &None,
+        &0,
+        &u64::MAX,
+    );
+
+    ctx.client.partial_payment(
+        &commitment,
+        &ctx.bob,
+        &(amount_due - initial_payment),
+        &0,
+        &u64::MAX,
+    );
+    ctx.client.withdraw(
+        &ctx.token,
+        &amount_due,
+        &commitment,
+        &ctx.alice,
+        &salt,
+        &1,
+        &u64::MAX,
+    );
+
+    let fee = 25i128;
+    let settled = amount_due - fee;
+    assert_eq!(settled + fee, amount_due);
+    assert_eq!(ctx.balance(&ctx.alice), settled);
+    assert_eq!(ctx.balance(&ctx.platform_wallet), fee);
+}
+
 // ============================================================================
 // Multi-Sig Arbiter Tests
 // ============================================================================
@@ -3944,22 +4176,26 @@ fn test_multi_sig_vote_threshold_reached() {
     let amount: i128 = 5000;
     let salt = Bytes::from_slice(&env, b"multi_sig_salt");
 
-    // Create escrow with multi-sig arbiters (2-of-3)
+    // Create escrow with multi-sig arbiters (2-of-3) through the public
+    // deposit variant — no direct storage manipulation.
     let token_client = token::StellarAssetClient::new(&env, &token);
     token_client.mint(&owner, &amount);
-    // We need to manually create an escrow entry with multi-sig config
-    // For now, we'll test the vote and resolution logic directly
-    // This test assumes we have a way to create multi-sig escrows
-    // In production, this would be done via a new deposit function variant
-    // For testing purposes, we'll use the existing deposit and then manually
-    // update the storage to have multi-sig arbiters
-    let commitment = client.deposit(
+    let mut arbiters = soroban_sdk::Vec::new(&env);
+    for a in [
+        arbiter1.clone(),
+        Address::generate(&env),
+        Address::generate(&env),
+    ] {
+        arbiters.push_back(a);
+    }
+    let commitment = client.deposit_multi_sig(
         &token,
         &amount,
         &owner,
         &salt,
         &1000,
-        &Some(arbiter1),
+        &arbiters,
+        &2u32,
         &0u64,
         &u64::MAX,
     );
@@ -3969,9 +4205,10 @@ fn test_multi_sig_vote_threshold_reached() {
         client.get_commitment_state(&commitment),
         Some(EscrowStatus::Disputed)
     );
-    // Note: Full multi-sig testing requires updating the deposit functions
-    // to accept arbiters array and threshold. The core logic is implemented
-    // and tested via the escrow module functions directly.
+    // The escrow is now in multi-sig mode, so `vote_for_dispute` no longer
+    // rejects it with `NoArbiter`.
+    let vote = client.try_vote_for_dispute(&arbiter1, &commitment, &true, &0u64, &u64::MAX);
+    assert!(vote.is_ok());
 }
 
 #[test]
@@ -4160,6 +4397,38 @@ fn test_pause_reason_codes_and_events() {
         &u64::MAX,
     );
     assert_contract_error(result, QuickexError::OperationPaused);
+}
+
+/// Regression: `set_pause_flags` used to iterate a hardcoded
+/// `[1, 2, 4, 8, 16, 32]` flag list that predated `PauseFlag::FeeWithdrawal = 64`,
+/// so `pause_features(mask = 64, ...)` set the bitmask but
+/// `get_feature_pause_reason(FeeWithdrawal)` silently returned 0 and lost the
+/// audit trail. The reason recorded by `pause_features` must be readable back.
+#[test]
+fn test_fee_withdrawal_pause_reason_recorded() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(QuickexContract, ());
+    let client = QuickexContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin);
+
+    let reason = 42u32;
+    client.pause_features(&admin, &(PauseFlag::FeeWithdrawal as u64), &reason);
+    assert!(client.is_feature_paused(&PauseFlag::FeeWithdrawal));
+    assert_eq!(
+        client.get_feature_pause_reason(&PauseFlag::FeeWithdrawal),
+        reason
+    );
+
+    client.unpause_features(&admin, &(PauseFlag::FeeWithdrawal as u64), &reason);
+    assert!(!client.is_feature_paused(&PauseFlag::FeeWithdrawal));
+    assert_eq!(
+        client.get_feature_pause_reason(&PauseFlag::FeeWithdrawal),
+        0u32
+    );
 }
 
 // ============================================================================

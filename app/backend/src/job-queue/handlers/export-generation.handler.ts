@@ -13,6 +13,11 @@ import { ExportGenerationPayload } from '../types/job-payloads.types';
 import { SupabaseService } from '../../supabase/supabase.service';
 import { NotificationService } from '../../notifications/notification.service';
 import { ExportCompletedPayload } from '../../notifications/types/notification.types';
+import { ExportStorageService } from '../../exports/export-storage.service';
+import { NotificationPreferencesRepository } from '../../notifications/notification-preferences.repository';
+import { isDeliverableWebhookUrl } from '../../notifications/webhook-target.util';
+import { JobQueueService } from '../job-queue.service';
+import { JobType } from '../types';
 
 /**
  * Error thrown for permanent job failures (no retry)
@@ -39,6 +44,9 @@ export class ExportGenerationHandler implements JobHandler<ExportGenerationPaylo
   constructor(
     private readonly supabase: SupabaseService,
     private readonly notificationService: NotificationService,
+    private readonly exportStorageService: ExportStorageService,
+    private readonly notificationPrefsRepo: NotificationPreferencesRepository,
+    private readonly jobQueueService: JobQueueService,
   ) {}
 
   /**
@@ -267,11 +275,67 @@ export class ExportGenerationHandler implements JobHandler<ExportGenerationPaylo
     cancellationToken.throwIfCancelled();
 
     switch (deliveryMethod) {
-      case 'webhook':
-        // TODO: Implement webhook delivery
-        // For now, just log
-        this.logger.log(`Webhook delivery not yet implemented for user ${userId}`);
+      case 'webhook': {
+        // Get user's webhook preference
+        const webhookPrefs = await this.notificationPrefsRepo.getWebhooksByPublicKey(userId);
+        const webhookPref = webhookPrefs.find(
+          p => p.enabled && isDeliverableWebhookUrl(p.webhookUrl),
+        );
+
+        if (!webhookPref || !webhookPref.webhookUrl) {
+          const errorMessage = `No enabled https webhook URL found for user ${userId}`;
+          this.logger.error(errorMessage);
+          throw new Error(errorMessage);
+        }
+
+        // The raw export body is never sent over the webhook. Store the
+        // artifact and hand the recipient a time-limited signed download
+        // reference instead, so exports containing customer PII are only
+        // retrievable by a holder of the scoped, expiring token.
+        const { storageKey, sizeBytes } = await this.exportStorageService.uploadArtifact({
+          jobId,
+          userId,
+          content: exportData,
+          format: format as 'csv' | 'json',
+          exportType,
+        });
+
+        const { token, expiresAt } = this.exportStorageService.issueDownloadToken({
+          jobId,
+          userId,
+        });
+
+        // Enqueue webhook delivery job
+        await this.jobQueueService.enqueue(JobType.WEBHOOK_DELIVERY, {
+          recipientPublicKey: userId,
+          webhookUrl: webhookPref.webhookUrl,
+          eventType: 'export.completed',
+          eventId: `export:${jobId}`,
+          // HMAC-sign the delivery using the registered webhook secret.
+          signingSecret: webhookPref.webhookSecret,
+          // Attribute a permanent delivery failure back to this export job so
+          // it is not reported as a successful delivery.
+          relatedJobId: jobId,
+          payload: {
+            exportType,
+            format,
+            recordCount,
+            jobId,
+            sizeBytes,
+            downloadReference: {
+              storageKey,
+              userId,
+              token,
+              tokenExpiresAt: expiresAt,
+            },
+          },
+        });
+
+        this.logger.log(
+          `Webhook delivery enqueued for user ${userId} (jobId: ${jobId}, url: ${webhookPref.webhookUrl}, signed: ${webhookPref.webhookSecret ? 'yes' : 'no'}, downloadExpiresAt: ${new Date(expiresAt * 1000).toISOString()})`,
+        );
         break;
+      }
 
       case 'email': {
         const payload: ExportCompletedPayload = {
@@ -308,11 +372,51 @@ export class ExportGenerationHandler implements JobHandler<ExportGenerationPaylo
         break;
       }
 
-      case 'download':
-        // TODO: Implement download link generation (store in S3/Supabase Storage)
-        // For now, just log
-        this.logger.log(`Download link generation not yet implemented for user ${userId}`);
+      case 'download': {
+        // Upload artifact to object storage and issue a signed download token.
+        const { storageKey, sizeBytes } = await this.exportStorageService.uploadArtifact({
+          jobId,
+          userId,
+          content: exportData,
+          format: format as 'csv' | 'json',
+          exportType,
+        });
+
+        const { token, expiresAt } = this.exportStorageService.issueDownloadToken({
+          jobId,
+          userId,
+        });
+
+        this.logger.log(
+          `Export artifact stored (key=${storageKey}, size=${sizeBytes}B, expiresAt=${new Date(expiresAt * 1000).toISOString()}, jobId=${jobId})`,
+        );
+
+        // Notify the user that their download link is ready.
+        const downloadPayload: ExportCompletedPayload = {
+          eventType: 'export.completed',
+          eventId: `export:${jobId}`,
+          recipientPublicKey: userId,
+          title: `Your ${exportType} export is ready to download`,
+          body: `Your ${(format as string).toUpperCase()} export of ${recordCount} ${recordCount === 1 ? 'record' : 'records'} is ready. Use the download token to retrieve it.`,
+          occurredAt: new Date().toISOString(),
+          exportType,
+          format,
+          recordCount,
+          jobId,
+          metadata: {
+            jobId,
+            exportType,
+            format,
+            recordCount,
+            sizeBytes,
+            downloadToken: token,
+            tokenExpiresAt: expiresAt,
+          },
+        };
+
+        await this.notificationService.deliverExportEmail(downloadPayload);
         break;
+      }
 
       default:
         throw new PermanentJobError(`Unsupported delivery method: ${deliveryMethod}`);
@@ -373,13 +477,27 @@ export class ExportGenerationHandler implements JobHandler<ExportGenerationPaylo
    * **Validates: Requirements 9.5**
    */
   async onFailure(job: Job<ExportGenerationPayload>, error: Error): Promise<void> {
-    const { userId, exportType } = job.payload;
+    const { userId, exportType, format } = job.payload;
 
     this.logger.error(
       `Export generation permanently failed for user ${userId} (type: ${exportType}, jobId: ${job.id}): ${error.message}`,
       error.stack,
     );
 
-    // TODO: Notify user of export failure via notification system
+    // Derive a user-safe reason: use only the error message (never the stack
+    // trace) and fall back to a generic phrase so internal details are never
+    // surfaced to the end user.
+    const safeReason =
+      error instanceof Error && error.message
+        ? error.message.replace(/\s*\n[\s\S]*$/, '') // strip any embedded newlines / stack frames
+        : 'An unexpected error occurred';
+
+    await this.notificationService.notifyExportFailed(
+      userId,
+      job.id,
+      exportType,
+      format,
+      safeReason,
+    );
   }
 }

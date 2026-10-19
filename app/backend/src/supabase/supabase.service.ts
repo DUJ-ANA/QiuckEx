@@ -2,6 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 
 import { AppConfigService } from "../config";
+import { createTracedFetch } from "../tracing/traced-fetch";
 import {
   EscrowDbStatus,
   EscrowRecord,
@@ -31,6 +32,30 @@ export interface TrendingCreatorResult extends SearchProfileResult {
 
 export interface FeaturedProfileResult extends SearchProfileResult {
   featured_rank: number | null;
+}
+
+/**
+ * The editable presentation fields behind `GET`/`PUT /profile`.
+ *
+ * Mirrors `ProfileCustomization` in `src/usernames/usernames.repository.ts`;
+ * kept local to match how every other usernames type is duplicated in this
+ * file (see `SearchProfileResult`).
+ */
+export interface ProfileCustomization {
+  primary_color: string | null;
+  avatar_url: string | null;
+  bio: string | null;
+  twitter_handle: string | null;
+  discord_handle: string | null;
+  github_handle: string | null;
+}
+
+export interface ProfileResult extends ProfileCustomization {
+  id: string;
+  username: string;
+  public_key: string;
+  created_at: string;
+  is_public: boolean;
 }
 
 export interface MarketplaceListing {
@@ -92,6 +117,12 @@ export class SupabaseService {
     this.client = createClient(url, anonKey, {
       auth: {
         persistSession: false,
+      },
+      global: {
+        // Instruments every PostgREST/RPC call this client makes with a
+        // db.* span, so all ~30 query methods below get tracing for free
+        // instead of each being wrapped individually.
+        fetch: createTracedFetch("db.supabase"),
       },
     });
 
@@ -652,6 +683,28 @@ export class SupabaseService {
   }
 
   /**
+   * Fetch the full profile row (including presentation fields) for a public
+   * profile. The `is_public = true` filter is baked into the query, so there is
+   * no TOCTOU window between a visibility check and the data fetch.
+   */
+  async getPublicProfileForDisplay(
+    username: string,
+  ): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .eq("username", username)
+      .eq("is_public", true)
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
+  }
+
+  /**
    * Toggle public profile visibility
    */
   async togglePublicProfile(
@@ -667,6 +720,60 @@ export class SupabaseService {
       .eq("username", username);
 
     if (error) this.handleError(error);
+  }
+
+  /**
+   * Load a profile with its presentation fields, ignoring visibility.
+   *
+   * Used by `GET /profile`, which the owner calls on their own profile even
+   * while `is_public` is false, so the settings page can show current values
+   * for a private profile. Ownership is verified by the caller.
+   */
+  async getProfileForOwner(username: string): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .eq("username", username)
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
+  }
+
+  /**
+   * Persist the presentation fields for a profile row and return the new state.
+   *
+   * Returning the row rather than void lets the controller echo exactly what was
+   * persisted, so the client does not have to guess how the database normalized
+   * the values.
+   */
+  async updateProfileCustomization(
+    username: string,
+    customization: ProfileCustomization,
+  ): Promise<ProfileResult | null> {
+    const { data, error } = await this.client
+      .from("usernames")
+      .update({
+        primary_color: customization.primary_color,
+        avatar_url: customization.avatar_url,
+        bio: customization.bio,
+        twitter_handle: customization.twitter_handle,
+        discord_handle: customization.discord_handle,
+        github_handle: customization.github_handle,
+        last_active_at: new Date().toISOString(),
+      })
+      .eq("username", username)
+      .select(
+        "id, username, public_key, created_at, is_public, primary_color, avatar_url, bio, twitter_handle, discord_handle, github_handle",
+      )
+      .maybeSingle();
+
+    if (error) this.handleError(error);
+
+    return (data as ProfileResult) ?? null;
   }
 
   async createListing(
@@ -722,26 +829,52 @@ export class SupabaseService {
     };
   }
 
-  async getActiveListings(
-    limit: number,
-    cursor: string | null,
-  ): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
-    const effectiveLimit = Math.min(100, Math.max(1, limit));
+  /**
+   * Query active listings with sort, price range, and username filters,
+   * using cursor-based pagination.
+   *
+   * The cursor filter mirrors the pattern used by `getActiveListings`
+   * above rather than the generic `applyCursorFilter` util: it fetches
+   * `limit + 1` rows ordered by (sortColumn, id) and decodes an opaque
+   * `{ pk, id }` cursor where `pk` is the value of whatever column is
+   * currently being sorted on.
+   */
+  async queryActiveListings(options: {
+    limit: number;
+    cursor: string | null;
+    sortColumn: 'created_at' | 'asking_price';
+    ascending: boolean;
+    minPrice?: number;
+    maxPrice?: number;
+    username?: string;
+  }): Promise<{ listings: MarketplaceListing[]; next_cursor: string | null; has_more: boolean; total: number }> {
+    const effectiveLimit = Math.min(100, Math.max(1, options.limit));
+    const { sortColumn, ascending } = options;
 
     let query = this.client
       .from('username_marketplace')
       .select('*', { count: 'exact' })
       .eq('status', 'active');
 
-    if (cursor) {
-      // Decode cursor
+    if (options.minPrice !== undefined) {
+      query = query.gte('asking_price', options.minPrice);
+    }
+    if (options.maxPrice !== undefined) {
+      query = query.lte('asking_price', options.maxPrice);
+    }
+    if (options.username) {
+      query = query.ilike('username', `%${options.username.trim().toLowerCase()}%`);
+    }
+
+    if (options.cursor) {
       try {
-        const json = Buffer.from(cursor, 'base64url').toString('utf-8');
+        const json = Buffer.from(options.cursor, 'base64url').toString('utf-8');
         const parsed = JSON.parse(json);
         if (typeof parsed.pk === 'string' && typeof parsed.id === 'string') {
-          query = query
-            .lt('created_at', parsed.pk)
-            .or(`created_at.eq.${parsed.pk},id.lt.${parsed.id}`);
+          const cmpOp = ascending ? 'gt' : 'lt';
+          query = query[cmpOp](sortColumn, parsed.pk).or(
+            `${sortColumn}.eq.${parsed.pk},id.${cmpOp}.${parsed.id}`,
+          );
         }
       } catch {
         // invalid cursor – start from beginning
@@ -749,8 +882,8 @@ export class SupabaseService {
     }
 
     query = query
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
+      .order(sortColumn, { ascending })
+      .order('id', { ascending })
       .limit(effectiveLimit + 1);
 
     const { data, error, count } = await query;
@@ -762,9 +895,9 @@ export class SupabaseService {
 
     let nextCursor: string | null = null;
     if (hasMore && listings.length > 0) {
-      const last = listings[listings.length - 1];
+      const last = listings[listings.length - 1] as unknown as Record<string, unknown>;
       nextCursor = Buffer.from(
-        JSON.stringify({ pk: last.created_at, id: last.id }),
+        JSON.stringify({ pk: String(last[sortColumn]), id: String(last['id']) }),
         'utf-8',
       ).toString('base64url');
     }
@@ -775,6 +908,22 @@ export class SupabaseService {
       has_more: hasMore,
       total: count ?? 0,
     };
+  }
+
+  /**
+   * Batch-fetch bids for a set of listing ids, used to attach bid summary
+   * data to a page of listings without an N+1 query per listing.
+   */
+  async getBidsForListingIds(listingIds: string[]): Promise<MarketplaceBid[]> {
+    if (listingIds.length === 0) {
+      return [];
+    }
+    const { data, error } = await this.client
+      .from('username_bids')
+      .select('*')
+      .in('listing_id', listingIds);
+    if (error) this.handleError(error);
+    return (data ?? []) as MarketplaceBid[];
   }
 
   async getBidsByListingIdPaginated(

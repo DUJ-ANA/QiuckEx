@@ -21,6 +21,8 @@ import type {
   AutoReconciliationSucceededNotificationPayload,
   PaymentLinkExpiredPayload,
   ExportCompletedPayload,
+  ExportFailedPayload,
+  RecurringPaymentDuePayload,
 } from "./types/notification.types";
 
 import {
@@ -251,6 +253,47 @@ export class NotificationService implements OnModuleInit {
     await this.dispatch(payload);
   }
 
+  @OnEvent("recurring.payment.due", { async: true })
+  async onRecurringPaymentDue(event: {
+    linkId: string;
+    executionId: string;
+    recipientPublicKey?: string;
+    username?: string;
+    destination?: string;
+    amount: number;
+    asset: string;
+    periodNumber: number;
+    scheduledAt?: string;
+  }): Promise<void> {
+    const recipientPublicKey = event.recipientPublicKey || event.destination || (event.username ? `user:${event.username}` : undefined);
+    if (!recipientPublicKey) return;
+
+    const payload: RecurringPaymentDuePayload = {
+      eventType: "recurring.payment.due",
+      eventId: `recurring-due:${event.executionId}`,
+      recipientPublicKey,
+      title: "Upcoming Recurring Payment",
+      body: `Your recurring payment of ${event.amount} ${event.asset} is scheduled to execute soon.`,
+      occurredAt: new Date().toISOString(),
+      linkId: event.linkId,
+      executionId: event.executionId,
+      username: event.username,
+      destination: event.destination,
+      amount: event.amount,
+      asset: event.asset,
+      periodNumber: event.periodNumber,
+      scheduledAt: event.scheduledAt || new Date().toISOString(),
+      metadata: {
+        linkId: event.linkId,
+        executionId: event.executionId,
+        amount: event.amount,
+        asset: event.asset,
+      },
+    };
+
+    await this.dispatch(payload);
+  }
+
   // ---------------------------------------------------------------------------
   // CORE DISPATCH (UPDATED WITH TEMPLATE)
   // ---------------------------------------------------------------------------
@@ -457,6 +500,44 @@ export class NotificationService implements OnModuleInit {
       templateVersionId: renderedTemplate?.templateVersionId,
       error: result.error,
     };
+  }
+
+  /**
+   * Notify the requesting user that their export job has permanently failed.
+   *
+   * Dispatches an `export.failed` notification through the standard
+   * multi-channel pipeline so user preferences (email, in-app, etc.) are
+   * respected.  The `failureReason` field is sanitised by the caller and must
+   * never contain raw stack traces or internal error messages.
+   *
+   * @param userId - Stellar public key of the user who requested the export.
+   * @param jobId - ID of the failed export generation job.
+   * @param exportType - The type of data (transactions, links, payments).
+   * @param format - The requested output format (csv or json).
+   * @param failureReason - A user-safe description of why the export failed.
+   */
+  async notifyExportFailed(
+    userId: string,
+    jobId: string,
+    exportType: string,
+    format: string,
+    failureReason: string,
+  ): Promise<void> {
+    const payload: ExportFailedPayload = {
+      eventType: "export.failed",
+      eventId: `export-failed:${jobId}`,
+      recipientPublicKey: userId,
+      title: `Your ${exportType} export failed`,
+      body: `We were unable to generate your ${format.toUpperCase()} export. ${failureReason}`,
+      occurredAt: new Date().toISOString(),
+      exportType,
+      format,
+      jobId,
+      failureReason,
+      metadata: { jobId, exportType, format, failureReason },
+    };
+
+    await this.dispatch(payload);
   }
 
   // ---------------------------------------------------------------------------

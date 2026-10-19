@@ -26,7 +26,7 @@
 use crate::{
     errors::QuickexError,
     events::EVENT_SCHEMA_VERSION,
-    storage::{CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
+    storage::{DataKey, CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
     types::FeeConfig,
     EscrowStatus, QuickexContract, QuickexContractClient,
 };
@@ -628,16 +628,74 @@ fn upgrade_harness_legacy_symbol_privacy_key_readable_after_upgrade() {
     );
 }
 
+/// Issue #862 (SC-W8-01): an account whose privacy state was set only through
+/// the deprecated numeric-level `enable_privacy` API before the consolidation
+/// must be readable — and consistent — through both call styles after the
+/// upgrade, and must converge onto the canonical key once touched.
+#[test]
+fn upgrade_harness_deprecated_privacy_level_migrates_to_canonical_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LegacyV0Contract, ());
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    {
+        let client = LegacyV0ContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+    }
+
+    // Seed only the deprecated numeric level key, simulating a pre-consolidation
+    // account that was never touched by the boolean `set_privacy` API.
+    env.as_contract(&contract_id, || {
+        let level_key = DataKey::PrivacyLevel(user.clone());
+        env.storage().persistent().set(&level_key, &1u32);
+    });
+
+    env.register_at(&contract_id, QuickexContract, ());
+    let client = QuickexContractClient::new(&env, &contract_id);
+    client.migrate(&admin);
+
+    // Both call styles agree, with no direct write yet.
+    assert!(
+        client.get_privacy(&user),
+        "legacy numeric level=1 must be readable as canonical `true` via get_privacy"
+    );
+    assert_eq!(
+        client.privacy_status(&user),
+        Some(1),
+        "privacy_status must agree with get_privacy for a legacy-only account"
+    );
+
+    // Touching the account through either API migrates it onto the canonical
+    // key and clears the deprecated numeric level permanently.
+    client.set_privacy(&user, &false);
+    assert!(!client.get_privacy(&user));
+    assert_eq!(client.privacy_status(&user), Some(0));
+
+    let level_still_present = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::PrivacyLevel(user.clone()))
+    });
+    assert!(
+        !level_still_present,
+        "deprecated PrivacyLevel key must be cleared once the account is migrated"
+    );
+}
+
 /// Regression: the escrow counter must not be touched by `migrate()`.
 ///
-/// `deposit()` does not use the escrow counter (only `create_escrow` does),
-/// so this test explicitly seeds the counter to a known non-zero value via
-/// storage and verifies it is unchanged after migration.
+/// No contract entrypoint writes the counter anymore — the `create_escrow`
+/// stub that once did was removed (SC-W8-02) — so this test seeds it
+/// directly via storage to a known non-zero value and verifies it is
+/// unchanged after migration.
 #[test]
 fn upgrade_harness_escrow_counter_survives_migration() {
     let (env, gs) = build_golden_state();
 
-    // Seed the counter to a known non-zero value (simulates prior create_escrow calls).
+    // Seed the counter to a known non-zero value directly via storage.
     env.as_contract(&gs.contract_id, || {
         for _ in 0..4 {
             crate::storage::increment_escrow_counter(&env);
@@ -946,4 +1004,46 @@ fn upgrade_safety_gate_non_admin_blocked() {
     // Non-admin attempts set_upgrade_window → fails.
     let result = client.try_set_upgrade_window(&non_admin, &1u64, &0u64);
     assert!(result.is_err(), "set_upgrade_window by non-admin must fail");
+}
+
+/// SC-W8-10 (Issue #871): a migration that fails must leave the stored
+/// version exactly where it started, not partially advanced.
+///
+/// This exercises Soroban's atomic-invocation rollback through the real
+/// `migrate()` entrypoint: the version-1 step itself runs successfully and
+/// writes `ContractVersion`, but the post-upgrade invariant check (fee_bps
+/// deliberately corrupted here) then fails, so the whole invocation —
+/// including that already-written version bump — is discarded.
+#[test]
+fn upgrade_harness_failed_migration_leaves_version_at_prior_value() {
+    let (env, gs) = build_golden_state();
+    // Swap in the current WASM but do NOT migrate yet — unlike
+    // `seed_admin_role`, which already calls `migrate()` once. This test
+    // needs the very first migrate attempt (legacy -> v1) to be the one
+    // that fails, so `before` is genuinely `LEGACY_CONTRACT_VERSION`.
+    let client = upgrade_to_current(&env, &gs.contract_id);
+
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 99999 });
+    });
+
+    let before = client.get_version();
+    assert_eq!(before, LEGACY_CONTRACT_VERSION);
+
+    let result = client.try_migrate(&gs.admin);
+    assert_eq!(result, Err(Ok(QuickexError::InternalError)));
+
+    let after = client.get_version();
+    assert_eq!(
+        after, before,
+        "a failed migrate() must not leave the version partially advanced"
+    );
+
+    // The contract is still usable and can complete the migration once the
+    // underlying problem is fixed — the failure was not fatal to the contract.
+    env.as_contract(&gs.contract_id, || {
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 200 });
+    });
+    let version = client.migrate(&gs.admin);
+    assert_eq!(version, CURRENT_CONTRACT_VERSION);
 }

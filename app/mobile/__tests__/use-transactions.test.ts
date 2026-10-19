@@ -96,6 +96,50 @@ describe("useTransactions", () => {
     expect(result.current.staleCache).toBe(false);
   });
 
+  it("does not fetch and stays non-loading when there is no account yet", async () => {
+    // A blank accountId means wallet state has not resolved (or no wallet is
+    // connected). The hook must settle empty instead of querying the backend.
+    const { result } = await renderHook(() => useTransactions(""));
+
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(result.current.loading).toBe(false);
+    expect(result.current.transactions).toEqual([]);
+    expect(result.current.error).toBeNull();
+    expect(result.current.hasMore).toBe(false);
+    expect(mockedFetchTransactions).not.toHaveBeenCalled();
+    expect(mockedGetCache).not.toHaveBeenCalled();
+  });
+
+  it("loads the account as soon as wallet state resolves after mount", async () => {
+    mockedFetchTransactions.mockResolvedValueOnce({
+      items: mockItems,
+      nextCursor: undefined,
+    });
+
+    const { result, rerender } = await renderHook(
+      ({ id }: { id: string }) => useTransactions(id),
+      { initialProps: { id: "" } },
+    );
+
+    expect(mockedFetchTransactions).not.toHaveBeenCalled();
+    expect(result.current.loading).toBe(false);
+
+    await act(async () => {
+      rerender({ id: ACCOUNT_ID });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(mockedFetchTransactions).toHaveBeenCalledWith(
+      ACCOUNT_ID,
+      expect.objectContaining({ cursor: undefined }),
+    );
+    expect(result.current.transactions).toHaveLength(2);
+    expect(result.current.loading).toBe(false);
+  });
+
   it("derives payment direction for each transaction", async () => {
     mockedFetchTransactions.mockResolvedValueOnce({
       items: mockItems,
@@ -192,6 +236,60 @@ describe("useTransactions", () => {
     expect(result.current.hasMore).toBe(false);
     // loadMore should NOT save to cache (only first page does)
     expect(mockedSaveCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("loadMore deduplicates overlapping pages by pagingToken (stable memory)", async () => {
+    // First page
+    mockedFetchTransactions.mockResolvedValueOnce({
+      items: mockItems,
+      nextCursor: "99-1-0",
+    });
+
+    const { result } = await renderHook(() => useTransactions(ACCOUNT_ID));
+
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(result.current.transactions).toHaveLength(2);
+
+    // Second page overlaps with the tail of the first page ("99-1-0").
+    const page2Items = [
+      {
+        amount: "10.0000000",
+        asset: "XLM",
+        timestamp: "2026-05-31T08:00:00Z",
+        source: OTHER_ACCOUNT,
+        destination: ACCOUNT_ID,
+        status: "Success" as const,
+        txHash: "ghi789",
+        pagingToken: "99-1-0",
+      },
+      {
+        amount: "5.0000000",
+        asset: "XLM",
+        timestamp: "2026-05-30T08:00:00Z",
+        source: OTHER_ACCOUNT,
+        destination: ACCOUNT_ID,
+        status: "Success" as const,
+        txHash: "jkl012",
+        pagingToken: "98-1-0",
+      },
+    ];
+    mockedFetchTransactions.mockResolvedValueOnce({
+      items: page2Items,
+      nextCursor: undefined,
+    });
+
+    await act(async () => {
+      result.current.loadMore();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // 2 + 2 with one overlap => 3 unique items, never 4.
+    expect(result.current.transactions).toHaveLength(3);
+    const tokens = result.current.transactions.map((t) => t.pagingToken);
+    expect(new Set(tokens).size).toBe(3);
   });
 
   it("refresh resets data and fetches from the beginning", async () => {

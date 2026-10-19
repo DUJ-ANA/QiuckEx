@@ -19,18 +19,20 @@ Indexers MUST read this field before decoding any other payload field.
 |---------|--------------------------------------------------|
 | 1       | Original schema – no `schema_version` field      |
 | 2       | Added `schema_version` to every event payload    |
+| 3       | Added deterministic `receipt_reference` to escrow lifecycle events (SC-W7-07) |
 
 ### Detecting the version
 
 - **v1 event**: `schema_version` key is absent from the data map.
 - **v2+ event**: `schema_version` key is present; value equals the version number.
 
-### Indexer migration plan (v1 → v2)
+### Indexer migration plan (v1 → v3)
 
 1. When processing an event, attempt to read `schema_version` from the data map.
 2. If absent → decode with the v1 decoder (legacy path).
 3. If present and `== 2` → decode with the v2 decoder.
-4. If present and `> 2` → log a warning and skip until the indexer is updated.
+4. If present and `== 3` → decode with the v3 decoder.
+5. If present and `> 3` → log a warning and skip until the indexer is updated.
    The reference implementation lives in
    `app/backend/src/ingestion/soroban-event.parser.ts`.
 
@@ -75,7 +77,7 @@ Release procedure:
 The canonical version constant lives in `src/events.rs`:
 
 ```rust
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
 ```
 
 Golden tests in `src/test.rs` (`test_event_schema_catalog_*`,
@@ -118,6 +120,22 @@ will cause those tests to fail, preventing accidental breakage.
    - Topic[3] = `eph_pub` or `recipient`
    - Data = `schema_version`, domain-specific fields, `timestamp`
 
+## Receipt references (v3)
+
+Since schema v3, escrow lifecycle events carry a deterministic
+`receipt_reference: BytesN<32>` payload field so off-chain receipt generation
+can align with on-chain outcomes reliably. See
+[`RECEIPT_REFERENCE_EVENTS.md`](./RECEIPT_REFERENCE_EVENTS.md) for the full
+design, derivation, and backend compatibility notes.
+
+Affected events:
+
+- `EscrowDeposited` (create)
+- `EscrowWithdrawn` (release)
+- `EscrowFinalized` (release)
+- `EscrowRefunded` (refund)
+- `RefundFinalized` (refund)
+
 ---
 
 ## Current event catalogue (Schema v2)
@@ -145,6 +163,16 @@ will cause those tests to fail, preventing accidental breakage.
 - `EscrowDisputed`
   - Topics: `TOPIC_ESCROW`, `EscrowDisputed`, `escrow_id`, `arbiter`
   - Data: `schema_version`, `timestamp`
+  - Single-arbiter escrows only: the `arbiter` topic is a required `Address`.
+
+- `MultiSigEscrowDisputed`
+  - Topics: `TOPIC_DISPUTE`, `MultiSigEscrowDisputed`, `escrow_id`
+  - Data: `arbiters`, `arbiter_threshold`, `schema_version`, `timestamp`
+  - Emitted instead of `EscrowDisputed` for escrows created by
+    `deposit_multi_sig`, which deliberately name no single arbiter. Indexers
+    that key on the `EscrowDisputed` name alone will not see multi-sig
+    disputes opening. Additive only — no existing event changed shape, so
+    the schema version is unchanged.
 
 ### Admin
 
